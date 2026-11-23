@@ -362,6 +362,7 @@ class TestExportAndCrossValidation:
         engine.execute_fusion_pipeline(job.job_id)
 
         snap = engine.create_snapshot("WT_EXP", partition_key_value="20261118")
+        engine.confirm_snapshot(snap.partition_id)
         plan = engine.create_export_plan(
             target_wide_table="WT_EXP", export_format="parquet",
             field_filter=["id", "name"],
@@ -370,6 +371,7 @@ class TestExportAndCrossValidation:
         assert result["ok"] is True
         assert result["exported_rows"] == 3
         assert result["format"] == "parquet"
+        assert result["projection"] == ["id", "name"]
 
     def test_cross_validation(self, engine: FusionEngine) -> None:
         """跨宽表交叉校验。"""

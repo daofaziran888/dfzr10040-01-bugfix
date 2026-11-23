@@ -29,6 +29,12 @@ from app.models import (
     WatermarkRecord,
     WideTableDef,
 )
+from app.snapshot_evidence import (
+    BatchEvidence,
+    SnapshotEvidence,
+    evidence_key,
+    partition_service,
+)
 
 
 def _now_iso() -> str:
@@ -176,6 +182,162 @@ class FusionEngine:
         )
         self._snapshots[sid] = snap
         return snap
+
+    def confirm_snapshot(
+        self,
+        snapshot_id: int,
+        *,
+        records: list[dict[str, Any]] | None = None,
+        schema_version: str = "",
+        transform_version: str = "",
+        batch_specs: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """确认快照：冻结当次提交的行明细、字段清单与每批版本依据。
+
+        确认后快照持有独立于实时宽表的证据；后续增量归并修改融合作业的
+        merged_records 不会影响已确认快照。未确认的旧分区只有编号和计数，
+        导出时按缺证处理。
+        """
+        snap = self._snapshots.get(snapshot_id)
+        if snap is None:
+            return {"ok": False, "message": f"分区快照 {snapshot_id} 不存在"}
+
+        if records is None:
+            job = self._find_fusion_job_by_table(snap.target_wide_table)
+            records = list(job.merged_records) if job else []
+
+        if batch_specs is not None:
+            batch_evidence = [
+                BatchEvidence(
+                    batch_index=int(spec.get("batch_index", idx)),
+                    source_code=str(spec.get("source_code", "")),
+                    source_version=str(spec.get("source_version", "")),
+                    transform_version=str(
+                        spec.get("transform_version", transform_version)
+                    ),
+                    field_mapping=dict(spec.get("field_mapping") or {}),
+                    raw_inputs=[dict(r) for r in (spec.get("raw_inputs") or [])],
+                    record_keys=list(spec.get("record_keys") or []),
+                )
+                for idx, spec in enumerate(batch_specs)
+            ]
+        else:
+            batch_evidence = self._derive_batch_evidence(
+                snap.target_wide_table, records, transform_version
+            )
+
+        evidence = partition_service.confirm_evidence(
+            partition_id=snap.partition_id,
+            partition_code=snap.partition_code,
+            target_wide_table=snap.target_wide_table,
+            records=records,
+            batch_evidence=batch_evidence,
+            schema_version=schema_version or f"schema-{snap.partition_code}",
+            transform_version=transform_version or "transform-v1",
+        )
+
+        snap.confirmed = True
+        snap.evidence_id = evidence.evidence_id
+        snap.confirmed_time = evidence.confirmed_time
+        snap.schema_version = evidence.schema_version
+        snap.frozen_columns = list(evidence.frozen_columns)
+        snap.frozen_record_count = len(evidence.frozen_records)
+        snap.record_count = len(evidence.frozen_records)
+        snap.status_mark = "可用"
+
+        return {
+            "ok": True,
+            "partition_code": snap.partition_code,
+            "evidence_id": evidence.evidence_id,
+            "schema_version": evidence.schema_version,
+            "transform_version": evidence.transform_version,
+            "record_count": len(evidence.frozen_records),
+            "frozen_columns": list(evidence.frozen_columns),
+            "batch_evidence": evidence.batch_summaries(),
+        }
+
+    def get_snapshot_evidence(self, snapshot_id: int) -> dict[str, Any]:
+        """查询快照确认证据：每批源数据版本、字段映射与原始输入可核。"""
+        snap = self._snapshots.get(snapshot_id)
+        if snap is None:
+            return {"ok": False, "code": "SNAPSHOT_NOT_FOUND",
+                    "message": f"分区快照 {snapshot_id} 不存在"}
+        evidence = (
+            partition_service.get_evidence(snap.evidence_id)
+            if snap.evidence_id else None
+        )
+        if evidence is None:
+            return {
+                "ok": False,
+                "code": "EVIDENCE_MISSING",
+                "message": (
+                    f"分区 {snap.partition_code} 只有编号和计数，"
+                    "缺少当次提交的确认证据（冻结明细、源数据版本与字段映射），"
+                    "无法证明明细来自当次提交"
+                ),
+                "missing_evidence": [
+                    "确认证据ID（evidence_id）",
+                    "冻结行明细（frozen_records）",
+                    "源数据版本与字段映射（batch_evidence）",
+                ],
+                "partition_code": snap.partition_code,
+            }
+        return {
+            "ok": True,
+            "partition_code": snap.partition_code,
+            "evidence_id": evidence.evidence_id,
+            "schema_version": evidence.schema_version,
+            "transform_version": evidence.transform_version,
+            "confirmed_time": evidence.confirmed_time,
+            "record_keys": list(evidence.record_keys),
+            "frozen_columns": list(evidence.frozen_columns),
+            "batch_evidence": evidence.batch_summaries(),
+        }
+
+    def _derive_batch_evidence(
+        self,
+        target_wide_table: str,
+        records: list[dict[str, Any]],
+        transform_version: str,
+    ) -> list[BatchEvidence]:
+        """未显式提供批次依据时，按来源分组保留可核原始输入与映射。"""
+        mappings = [
+            m for m in self._schemas.values()
+            if m.target_wide_table == target_wide_table
+        ]
+        mapping_by_source = {m.source_table: m for m in mappings}
+
+        groups: dict[str, list[dict[str, Any]]] = {}
+        order: list[str] = []
+        for idx, rec in enumerate(records):
+            source = str(rec.get("_source", "unknown"))
+            if source not in groups:
+                groups[source] = []
+                order.append(source)
+            groups[source].append(rec)
+
+        batch_evidence: list[BatchEvidence] = []
+        for batch_index, source in enumerate(order):
+            group_records = groups[source]
+            mapping = mapping_by_source.get(source)
+            field_mapping: dict[str, str] = {}
+            if mapping is not None:
+                try:
+                    field_mapping = json.loads(mapping.field_mapping_json)
+                except json.JSONDecodeError:
+                    field_mapping = {}
+            batch_evidence.append(BatchEvidence(
+                batch_index=batch_index,
+                source_code=source,
+                source_version=f"{source}@confirmed",
+                transform_version=transform_version or "transform-v1",
+                field_mapping=field_mapping,
+                raw_inputs=[dict(r) for r in group_records],
+                record_keys=[
+                    evidence_key(r, idx) for idx, r in enumerate(group_records)
+                ],
+            ))
+        return batch_evidence
 
     # ---- 3. fusion_job -> watermark_track -> delta_merge ----
 
@@ -539,38 +701,265 @@ class FusionEngine:
             "strategy_code": strategy.strategy_code,
         }
 
+    def _require_snapshot_evidence(
+        self, snapshot_id: int
+    ) -> tuple[SnapshotPartition | None, SnapshotEvidence | None, dict[str, Any] | None]:
+        """统一的快照证据校验：未确认/旧分区明确报出缺少的依据。"""
+        snap = self._snapshots.get(snapshot_id)
+        if snap is None:
+            return None, None, {
+                "ok": False,
+                "code": "SNAPSHOT_NOT_FOUND",
+                "message": f"分区快照 {snapshot_id} 不存在",
+            }
+        evidence = (
+            partition_service.get_evidence(snap.evidence_id)
+            if snap.evidence_id else None
+        )
+        if evidence is None:
+            return snap, None, {
+                "ok": False,
+                "code": "EVIDENCE_MISSING",
+                "message": (
+                    f"分区 {snap.partition_code} 只有编号和计数，缺少当次提交的确认证据"
+                    "（冻结明细、源数据版本与字段映射），无法证明明细来自当次提交；"
+                    "导出计划仍可用于其他已确认分区"
+                ),
+                "missing_evidence": [
+                    "确认证据ID（evidence_id）",
+                    "冻结行明细（frozen_records）",
+                    "每批源数据版本与字段映射（batch_evidence）",
+                ],
+                "partition_code": snap.partition_code,
+            }
+        return snap, evidence, None
+
+    def _live_records_for(self, target_wide_table: str) -> list[dict[str, Any]] | None:
+        job = self._find_fusion_job_by_table(target_wide_table)
+        return list(job.merged_records) if job else None
+
     def execute_export_from_snapshot(self, export_id: int,
                                      snapshot_id: int) -> dict[str, Any]:
-        """从分区快照执行数据导出。"""
+        """从分区快照导出：按快照当次确认的版本依据出数。
+
+        不再回读融合作业的实时 merged_records——增量归并后实时宽表的值
+        （如 20→99）不能污染旧快照；字段筛选只允许确认冻结列，行数上限
+        作用于冻结明细。
+        """
         plan = self._exports.get(export_id)
-        snap = self._snapshots.get(snapshot_id)
         if plan is None:
             return {"ok": False, "message": f"导出计划 {export_id} 不存在"}
-        if snap is None:
-            return {"ok": False, "message": f"分区快照 {snapshot_id} 不存在"}
 
-        fusion_job = self._find_fusion_job_by_table(snap.target_wide_table)
-        records = fusion_job.merged_records if fusion_job else []
+        snap, evidence, error = self._require_snapshot_evidence(snapshot_id)
+        if error is not None:
+            plan.export_status = "导出失败"
+            return error
+        assert snap is not None and evidence is not None
+
+        if plan.target_wide_table != evidence.target_wide_table:
+            return {
+                "ok": False,
+                "code": "TABLE_MISMATCH",
+                "message": (
+                    f"导出计划宽表 {plan.target_wide_table} 与快照 "
+                    f"{snap.partition_code} 宽表 {evidence.target_wide_table} 不一致"
+                ),
+            }
+
+        unknown = [c for c in plan.field_filter if c not in evidence.column_set()]
+        if unknown:
+            plan.export_status = "导出失败"
+            return {
+                "ok": False,
+                "code": "FIELD_NOT_IN_SNAPSHOT",
+                "message": (
+                    f"字段筛选 {unknown} 不在快照 {snap.partition_code} 确认版本 "
+                    f"{evidence.schema_version} 的冻结列中，不能混入其他版本新增的列"
+                ),
+                "frozen_columns": list(evidence.frozen_columns),
+            }
+
+        frozen = evidence.frozen_records
+        total_frozen = len(frozen)
+        if plan.row_limit and plan.row_limit > 0:
+            selected = frozen[:plan.row_limit]
+        else:
+            selected = list(frozen)
 
         if plan.field_filter:
-            records = [
-                {k: v for k, v in rec.items() if k in plan.field_filter}
-                for rec in records
-            ]
-
-        if plan.row_limit > 0 and len(records) > plan.row_limit:
-            records = records[:plan.row_limit]
+            projection = [c for c in evidence.frozen_columns if c in plan.field_filter]
+            records = [{c: row.get(c) for c in projection} for row in selected]
+        else:
+            projection = list(evidence.frozen_columns)
+            records = [dict(row) for row in selected]
 
         plan.export_status = "已完成"
+        plan.snapshot_partition_id = snap.partition_id
+        plan.evidence_id = evidence.evidence_id
+        plan.schema_version = evidence.schema_version
 
         return {
             "ok": True,
             "plan_code": plan.plan_code,
             "snapshot_code": snap.partition_code,
+            "evidence_id": evidence.evidence_id,
+            "schema_version": evidence.schema_version,
             "exported_rows": len(records),
+            "snapshot_total_rows": total_frozen,
+            "row_limit": plan.row_limit,
+            "projection": projection,
+            "record_keys": evidence.record_keys[:len(records)],
             "format": plan.export_format,
             "path": plan.export_path,
             "records": records,
+        }
+
+    def start_segmented_export(
+        self,
+        export_id: int,
+        snapshot_id: int,
+        *,
+        batch_size: int = 1,
+    ) -> dict[str, Any]:
+        """开始分段下载：凭快照确认证据创建会话，返回首批行片段。"""
+        plan = self._exports.get(export_id)
+        if plan is None:
+            return {"ok": False, "message": f"导出计划 {export_id} 不存在"}
+
+        snap, evidence, error = self._require_snapshot_evidence(snapshot_id)
+        if error is not None:
+            plan.export_status = "导出失败"
+            return error
+        assert snap is not None and evidence is not None
+
+        if plan.target_wide_table != evidence.target_wide_table:
+            return {
+                "ok": False,
+                "code": "TABLE_MISMATCH",
+                "message": (
+                    f"导出计划宽表 {plan.target_wide_table} 与快照 "
+                    f"{snap.partition_code} 宽表 {evidence.target_wide_table} 不一致"
+                ),
+            }
+
+        session, session_error = partition_service.create_session(
+            plan_id=plan.plan_id,
+            evidence=evidence,
+            field_filter=list(plan.field_filter),
+            row_limit=plan.row_limit,
+            batch_size=batch_size,
+        )
+        if session_error is not None:
+            plan.export_status = "导出失败"
+            return session_error
+
+        plan.export_status = "导出中"
+        plan.snapshot_partition_id = snap.partition_id
+        plan.evidence_id = evidence.evidence_id
+        plan.schema_version = evidence.schema_version
+
+        return self._fetch_next(plan, snap, evidence, session)
+
+    def resume_segmented_export(
+        self,
+        export_id: int,
+        session_id: str,
+    ) -> dict[str, Any]:
+        """断点续读：沿同一确认证据、同一投影和游标继续取下一段。"""
+        plan = self._exports.get(export_id)
+        if plan is None:
+            return {"ok": False, "message": f"导出计划 {export_id} 不存在"}
+        session = partition_service.get_session(session_id)
+        if session is None:
+            return {"ok": False, "code": "SESSION_NOT_FOUND",
+                    "message": f"分段导出会话 {session_id} 不存在或已过期"}
+        if session.plan_id != plan.plan_id:
+            return {"ok": False, "code": "SESSION_PLAN_MISMATCH",
+                    "message": "续读会话不属于该导出计划"}
+
+        evidence = partition_service.get_evidence(session.evidence_id)
+        if evidence is None:
+            return {
+                "ok": False,
+                "code": "EVIDENCE_MISSING",
+                "message": "续读所依据的确认证据已不存在，无法凭同一次确认出数",
+            }
+        snap = self._snapshots.get(session.partition_id)
+        if snap is None:
+            return {"ok": False, "code": "SNAPSHOT_NOT_FOUND",
+                    "message": f"分区快照 {session.partition_id} 不存在"}
+
+        return self._fetch_next(plan, snap, evidence, session)
+
+    def _fetch_next(
+        self,
+        plan: ExportPlan,
+        snap: SnapshotPartition,
+        evidence: SnapshotEvidence,
+        session: Any,
+    ) -> dict[str, Any]:
+        live_records = self._live_records_for(evidence.target_wide_table)
+        if not partition_service.is_delivery_available(evidence.evidence_id):
+            return partition_service.unavailable_response(
+                evidence, session, live_records
+            )
+        result = partition_service.fetch_fragment(evidence, session, live_records)
+        if result.get("finished"):
+            plan.export_status = "已完成"
+        return result
+
+    def set_partition_delivery_unavailable(
+        self, snapshot_id: int, reason: str = "分区服务暂时无法交付行片段"
+    ) -> dict[str, Any]:
+        """模拟分区服务中断：暂停行片段交付，但保留可核证据。"""
+        snap = self._snapshots.get(snapshot_id)
+        if snap is None:
+            return {"ok": False, "message": f"分区快照 {snapshot_id} 不存在"}
+        evidence = (
+            partition_service.get_evidence(snap.evidence_id)
+            if snap.evidence_id else None
+        )
+        if evidence is None:
+            return {
+                "ok": False,
+                "code": "EVIDENCE_MISSING",
+                "message": f"分区 {snap.partition_code} 缺少确认证据，无法设置交付闸门",
+            }
+        partition_service.set_delivery_unavailable(evidence.evidence_id, reason)
+        return {
+            "ok": True,
+            "partition_code": snap.partition_code,
+            "evidence_id": evidence.evidence_id,
+            "delivery_available": False,
+            "retained_evidence": {
+                "raw_inputs_verifiable": True,
+                "transform_version": evidence.transform_version,
+                "schema_version": evidence.schema_version,
+                "batch_evidence": evidence.batch_summaries(),
+            },
+        }
+
+    def restore_partition_delivery(self, snapshot_id: int) -> dict[str, Any]:
+        """恢复分区服务的行片段交付。"""
+        snap = self._snapshots.get(snapshot_id)
+        if snap is None:
+            return {"ok": False, "message": f"分区快照 {snapshot_id} 不存在"}
+        evidence = (
+            partition_service.get_evidence(snap.evidence_id)
+            if snap.evidence_id else None
+        )
+        if evidence is None:
+            return {
+                "ok": False,
+                "code": "EVIDENCE_MISSING",
+                "message": f"分区 {snap.partition_code} 缺少确认证据",
+            }
+        partition_service.restore_delivery(evidence.evidence_id)
+        return {
+            "ok": True,
+            "partition_code": snap.partition_code,
+            "evidence_id": evidence.evidence_id,
+            "delivery_available": True,
         }
 
     def execute_cross_validation(self, plan_id: int) -> dict[str, Any]:

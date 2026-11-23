@@ -237,10 +237,16 @@ class TestSnapshotExport:
             target_wide_table="WT_ES", export_format="csv",
             field_filter=["id", "name"],
         )
+        # 导出前必须先确认快照，冻结当次提交的版本依据
+        confirm = engine.confirm_snapshot(snap.partition_id)
+        assert confirm["ok"] is True
         result = engine.execute_export_from_snapshot(plan.plan_id, snap.partition_id)
         assert result["ok"] is True
         assert result["format"] == "csv"
         assert result["exported_rows"] == 3
+        # 投影列只含确认冻结列中的筛选字段，且列顺序固定
+        assert result["projection"] == ["id", "name"]
+        assert set(result["records"][0].keys()) == {"id", "name"}
 
     def test_export_with_row_limit(self, engine: FusionEngine) -> None:
         """导出带行数限制。"""
@@ -258,6 +264,7 @@ class TestSnapshotExport:
         snap = engine.create_snapshot(
             target_wide_table="WT_RL", partition_key_value="20261118",
         )
+        engine.confirm_snapshot(snap.partition_id)
         plan = engine.create_export_plan(
             target_wide_table="WT_RL", export_format="parquet",
             row_limit=1,
@@ -265,6 +272,44 @@ class TestSnapshotExport:
         result = engine.execute_export_from_snapshot(plan.plan_id, snap.partition_id)
         assert result["ok"] is True
         assert result["exported_rows"] <= 1
+        assert result["snapshot_total_rows"] == 3
+
+    def test_export_old_snapshot_without_evidence_reports_missing(
+        self, engine: FusionEngine
+    ) -> None:
+        """只有编号和计数的旧分区：明确报出缺少的依据，不回读实时宽表。"""
+        engine.register_source(
+            source_code="SRC_OLD", source_name="old_source", source_type="MySQL",
+            connection_string="conn://old",
+        )
+        job = engine.create_fusion_job(
+            target_wide_table="WT_OLD",
+            participant_sources=["SRC_OLD"],
+            join_key="id",
+        )
+        engine.execute_fusion_pipeline(job.job_id)
+
+        # 旧分区：只设置编号与计数，从未确认，无冻结证据
+        snap = engine.create_snapshot(
+            target_wide_table="WT_OLD", partition_key_value="20261101",
+        )
+        snap.record_count = 3
+        plan = engine.create_export_plan(
+            target_wide_table="WT_OLD", export_format="csv",
+        )
+        result = engine.execute_export_from_snapshot(plan.plan_id, snap.partition_id)
+        assert result["ok"] is False
+        assert result["code"] == "EVIDENCE_MISSING"
+        assert "只有编号和计数" in result["message"]
+        assert result["missing_evidence"]
+        # 计划本身仍可用于其他已确认分区
+        other = engine.create_snapshot(
+            target_wide_table="WT_OLD", partition_key_value="20261102",
+        )
+        engine.confirm_snapshot(other.partition_id)
+        ok_result = engine.execute_export_from_snapshot(plan.plan_id, other.partition_id)
+        assert ok_result["ok"] is True
+        assert ok_result["snapshot_code"] == other.partition_code
 
     def test_export_nonexistent_snapshot(self, engine: FusionEngine) -> None:
         """从不存在快照导出时返回失败。"""

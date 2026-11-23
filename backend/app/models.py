@@ -188,7 +188,12 @@ class QualityGateRule:
 
 @dataclass
 class SnapshotPartition:
-    """分区快照：按日分区快照管理与版本标记。"""
+    """分区快照：按日分区快照管理与版本标记。
+
+    快照只有在「确认」后才携带当次提交的完整版本依据（冻结行、字段清单、
+    每批源数据版本与字段映射、转换版本）。只有编号和计数的旧分区没有这些
+    依据，重新导出时必须明确报出缺证，不能回读实时宽表数据冒充快照。
+    """
     partition_id: int
     partition_code: str
     target_wide_table: str
@@ -198,6 +203,13 @@ class SnapshotPartition:
     status_mark: str
     dependency_partitions: list[str]
     created_time: str
+    # 当次确认的版本依据（由 PartitionService.confirm_evidence 写入）
+    evidence_id: str = ""
+    confirmed: bool = False
+    confirmed_time: str = ""
+    schema_version: str = ""
+    frozen_columns: list[str] = field(default_factory=list)
+    frozen_record_count: int = 0
 
     def to_record(self) -> dict[str, Any]:
         return {
@@ -298,7 +310,11 @@ class WatermarkRecord:
 
 @dataclass
 class ExportPlan:
-    """快照导出：宽表快照的按需导出与多格式转换。"""
+    """快照导出：宽表快照的按需导出与多格式转换。
+
+    导出计划必须绑定一个已确认的分区快照，按快照证据里冻结的版本读取，
+    不允许回读实时宽表；字段筛选只能落在当次确认冻结的列上。
+    """
     plan_id: int
     plan_code: str
     target_wide_table: str
@@ -308,6 +324,10 @@ class ExportPlan:
     export_path: str
     row_limit: int = 0
     export_status: str = "待导出"
+    # 关联的已确认分区快照及其证据版本，确认取数依据后写入
+    snapshot_partition_id: int = 0
+    evidence_id: str = ""
+    schema_version: str = ""
 
 
 @dataclass
